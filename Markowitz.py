@@ -62,6 +62,9 @@ class EqualWeightPortfolio:
         """
         TODO: Complete Task 1 Below
         """
+        weight = 1 / len(assets)
+        # Assign equal weight to each included asset for all dates
+        self.portfolio_weights.loc[:, assets] = weight
 
         """
         TODO: Complete Task 1 Above
@@ -113,15 +116,34 @@ class RiskParityPortfolio:
         """
         TODO: Complete Task 2 Below
         """
+        # Calculate the rolling standard deviation (volatility) for all included assets
+        # The lookback window is self.lookback.
+        rolling_std = df_returns[assets].rolling(window=self.lookback).std()
 
+        # Calculate the inverse volatility (1/sigma)
+        # This will contain NaN values for the initial lookback-1 rows
+        inverse_volatility = 1 / rolling_std.shift(1)
 
+        # Calculate the sum of inverse volatilities for normalization
+        sum_inverse_volatility = inverse_volatility.sum(axis=1)
 
+        # Calculate the Risk Parity weights (w_i)
+        # The weight is (1/sigma_i) / sum(1/sigma_j)
+        rp_weights = inverse_volatility.div(sum_inverse_volatility, axis=0)
+
+        # Assign the calculated weights to the correct columns in the portfolio_weights DataFrame
+        # The weights are only valid from the lookback-th row onwards.
+        self.portfolio_weights.loc[:, assets] = rp_weights
+        
         """
         TODO: Complete Task 2 Above
         """
 
         self.portfolio_weights.ffill(inplace=True)
         self.portfolio_weights.fillna(0, inplace=True)
+
+        first_non_zero_row_index = self.portfolio_weights.iloc[self.lookback:].sum(axis=1).gt(0).idxmax()
+        self.portfolio_weights.loc[first_non_zero_row_index, :] = 0.0
 
     def calculate_portfolio_returns(self):
         # Ensure weights are calculated
@@ -187,11 +209,11 @@ class MeanVariancePortfolio:
                 """
                 TODO: Complete Task 3 Below
                 """
-
-                # Sample Code: Initialize Decision w and the Objective
-                # NOTE: You can modify the following code
-                w = model.addMVar(n, name="w", ub=1)
-                model.setObjective(w.sum(), gp.GRB.MAXIMIZE)
+                
+                w = model.addMVar(n, lb=0.0, ub=1.0, name="w")
+                model.addConstr(w.sum() == 1.0, name="budget")
+                obj = w @ mu - (gamma / 2.0) * (w @ Sigma @ w)
+                model.setObjective(obj, gp.GRB.MAXIMIZE)
 
                 """
                 TODO: Complete Task 3 Above
@@ -211,12 +233,8 @@ class MeanVariancePortfolio:
                     print("Model is infeasible or unbounded.")
 
                 if model.status == gp.GRB.OPTIMAL or model.status == gp.GRB.SUBOPTIMAL:
-                    # Extract the solution
-                    solution = []
-                    for i in range(n):
-                        var = model.getVarByName(f"w[{i}]")
-                        # print(f"w {i} = {var.X}")
-                        solution.append(var.X)
+                    # Extract the solution directly from the MVar
+                    solution = list(w.X)
 
         return solution
 
