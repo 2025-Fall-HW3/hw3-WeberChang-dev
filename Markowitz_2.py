@@ -70,7 +70,120 @@ class MyPortfolio:
         """
         TODO: Complete Task 4 Below
         """
+        # Parameters for the enhanced strategy
+        mom_lookback = 252                    # 12-month momentum
+        cov_lookback = max(self.lookback, 60) # at least 60 days for covariance
+        shrink_alpha = 0.2                    # shrinkage intensity (0=no shrink, 1=full shrink)
+        target_vol = 0.10                     # target annual vol (10%)
+        max_leverage = 2.0                    # cap on leverage
+        max_weight = 0.30                     # per-asset maximum weight (before leverage)
+        smoothing = 0.85                      # weight smoothing (0=no smoothing, 1=full hold)
         
+        # initialize rows as zeros
+        self.portfolio_weights.loc[:, :] = 0.0
+
+        prev_w = pd.Series(0.0, index=self.price.columns)
+
+        n = len(assets)
+        for t in range(cov_lookback, len(self.price)):
+            current_date = self.price.index[t]
+
+            # rolling windows for returns used in cov / vol
+            window_returns = self.returns.iloc[t-cov_lookback : t][assets]
+
+            # sample cov and vol
+            cov = window_returns.cov().values
+            vol = window_returns.std()
+
+            # shrink covariance toward avg variance * I (Ledoit-Wolf style simple shrink)
+            avg_var = np.mean(np.diag(cov))
+            cov_shrunk = (1 - shrink_alpha) * cov + shrink_alpha * (np.eye(n) * avg_var)
+
+            # momentum signal (12-month simple return). If too short, use available.
+            if t >= mom_lookback:
+                past_price = self.price[assets].iloc[t - mom_lookback]
+                recent_price = self.price[assets].iloc[t]
+                mom = (recent_price.values / past_price.values) - 1.0
+            else:
+                # short series: use lookback returns as proxy
+                mom = window_returns.mean().values * self.lookback
+
+            # respect NaNs
+            mom = np.nan_to_num(mom, nan=0.0)
+
+            # zero-out negative momentum (long-only momentum filter)
+            mom_signal = np.maximum(mom, 0.0)
+
+            # if all signals are zero (no positive momentum), fallback to inverse-vol weighting
+            if np.all(mom_signal == 0):
+                raw_w = 1.0 / np.maximum(vol.values, 1e-8)
+                raw_w = np.nan_to_num(raw_w)
+            else:
+                # Tangency direction: solve Cov^{-1} * signal
+                try:
+                    x = np.linalg.solve(cov_shrunk, mom_signal)
+                except np.linalg.LinAlgError:
+                    # fallback to pseudo-inverse
+                    x = np.dot(np.linalg.pinv(cov_shrunk), mom_signal)
+
+                # force negatives to zero (long-only)
+                x = np.maximum(x, 0.0)
+                raw_w = x
+
+                # if numerical issues lead to all zeros, fallback again
+                if np.all(raw_w == 0.0):
+                    raw_w = 1.0 / np.maximum(vol.values, 1e-8)
+
+            # normalize (pre-cap)
+            if raw_w.sum() <= 0:
+                w = np.ones_like(raw_w) / len(raw_w)
+            else:
+                w = raw_w / raw_w.sum()
+
+            # enforce max weight cap and renormalize (iterate simple clipping)
+            w = np.minimum(w, max_weight)
+            if w.sum() == 0:
+                w = np.ones_like(w) / len(w)
+            else:
+                w = w / w.sum()
+
+            # compute current portfolio volatility (annualized)
+            port_var = float(np.dot(w, np.dot(cov_shrunk, w)))
+            port_vol = np.sqrt(port_var) * np.sqrt(252)  # annualize: sqrt(252)
+
+            # volatility targeting (apply leverage)
+            if port_vol > 0:
+                lev = target_vol / port_vol
+            else:
+                lev = 1.0
+            lev = min(lev, max_leverage)
+
+            w = w * lev
+
+            # map to DataFrame index order and apply smoothing with previous weights
+            w_series = pd.Series(0.0, index=self.price.columns)
+            w_series[assets] = w
+
+            # smoothing to reduce turnover
+            w_series = smoothing * prev_w + (1 - smoothing) * w_series
+
+            # final safety: set negatives to zero and renormalize (shouldn't be negative)
+            w_series[w_series < 0] = 0.0
+            s = w_series.sum()
+            if s > 0:
+                w_series = w_series / s * min(1.0, s)  # preserve leverage proportionally if >1
+
+            # assign and update prev
+            self.portfolio_weights.loc[current_date, :] = w_series
+            prev_w = w_series.copy()
+
+        # ensure excluded ETF has zero weight
+        if self.exclude in self.portfolio_weights.columns:
+            self.portfolio_weights[self.exclude] = 0.0
+
+        # forward fill and fill NA
+        # (original code will ffill + fillna after this block)
+
         
         """
         TODO: Complete Task 4 Above
